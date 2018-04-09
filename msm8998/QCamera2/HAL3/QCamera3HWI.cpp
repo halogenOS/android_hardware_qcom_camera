@@ -147,6 +147,7 @@ extern uint8_t gNumCameraSessions;
 // The following Easel related variables must be protected by gHdrPlusClientLock.
 std::unique_ptr<EaselManagerClient> gEaselManagerClient;
 bool EaselManagerClientOpened = false; // If gEaselManagerClient is opened.
+int32_t gActiveEaselClient = 0; // The number of active cameras on Easel.
 std::unique_ptr<HdrPlusClient> gHdrPlusClient = nullptr;
 bool gHdrPlusClientOpening = false; // If HDR+ client is being opened.
 std::condition_variable gHdrPlusClientOpenCond; // Used to synchronize HDR+ client opening.
@@ -909,12 +910,24 @@ int QCamera3HardwareInterface::openCamera(struct hw_device_t **hw_device)
         std::unique_lock<std::mutex> l(gHdrPlusClientLock);
         if (gEaselManagerClient != nullptr && gEaselManagerClient->isEaselPresentOnDevice()) {
             logEaselEvent("EASEL_STARTUP_LATENCY", "Resume");
-            rc = gEaselManagerClient->resume(this);
-            if (rc != 0) {
-                ALOGE("%s: Resuming Easel failed: %s (%d)", __FUNCTION__, strerror(-rc), rc);
+            if (gActiveEaselClient == 0) {
+                rc = gEaselManagerClient->resume(this);
+                if (rc != 0) {
+                    ALOGE("%s: Resuming Easel failed: %s (%d)", __FUNCTION__, strerror(-rc), rc);
+                    return rc;
+                }
+                mEaselFwUpdated = false;
+            }
+
+            gActiveEaselClient++;
+
+            mQCamera3HdrPlusListenerThread = new QCamera3HdrPlusListenerThread(this);
+            rc = mQCamera3HdrPlusListenerThread->run("QCamera3HdrPlusListenerThread");
+            if (rc != OK) {
+                ALOGE("%s: Starting HDR+ client listener thread failed: %s (%d)", __FUNCTION__,
+                        strerror(-rc), rc);
                 return rc;
             }
-            mEaselFwUpdated = false;
         }
     }
 
@@ -928,12 +941,19 @@ int QCamera3HardwareInterface::openCamera(struct hw_device_t **hw_device)
         {
             std::unique_lock<std::mutex> l(gHdrPlusClientLock);
             if (gEaselManagerClient != nullptr && gEaselManagerClient->isEaselPresentOnDevice()) {
-                status_t suspendErr = gEaselManagerClient->suspend();
-                if (suspendErr != 0) {
-                    ALOGE("%s: Suspending Easel failed: %s (%d)", __FUNCTION__,
-                            strerror(-suspendErr), suspendErr);
+                if (gActiveEaselClient == 1) {
+                    status_t suspendErr = gEaselManagerClient->suspend();
+                    if (suspendErr != 0) {
+                        ALOGE("%s: Suspending Easel failed: %s (%d)", __FUNCTION__,
+                                strerror(-suspendErr), suspendErr);
+                    }
                 }
+                gActiveEaselClient--;
             }
+
+            mQCamera3HdrPlusListenerThread->requestExit();
+            mQCamera3HdrPlusListenerThread->join();
+            mQCamera3HdrPlusListenerThread = nullptr;
         }
     }
 
@@ -1124,11 +1144,18 @@ int QCamera3HardwareInterface::closeCamera()
     {
         std::unique_lock<std::mutex> l(gHdrPlusClientLock);
         if (EaselManagerClientOpened) {
-            rc = gEaselManagerClient->suspend();
-            if (rc != 0) {
-                ALOGE("%s: Suspending Easel failed: %s (%d)", __FUNCTION__, strerror(-rc), rc);
+            if (gActiveEaselClient == 1) {
+                rc = gEaselManagerClient->suspend();
+                if (rc != 0) {
+                    ALOGE("%s: Suspending Easel failed: %s (%d)", __FUNCTION__, strerror(-rc), rc);
+                }
             }
+            gActiveEaselClient--;
         }
+
+        mQCamera3HdrPlusListenerThread->requestExit();
+        mQCamera3HdrPlusListenerThread->join();
+        mQCamera3HdrPlusListenerThread = nullptr;
     }
 
     return rc;
@@ -5603,6 +5630,11 @@ no_error:
                 meta.find(NEXUS_EXPERIMENTAL_2016_HYBRID_AE_ENABLE).data.u8[0];
     }
 
+    if (meta.exists(NEXUS_EXPERIMENTAL_2017_MOTION_DETECTION_ENABLE)) {
+        pendingRequest.motion_detection_enable =
+                meta.find(NEXUS_EXPERIMENTAL_2017_MOTION_DETECTION_ENABLE).data.u8[0];
+    }
+
     /* DevCamDebug metadata processCaptureRequest */
     if (meta.exists(DEVCAMDEBUG_META_ENABLE)) {
         mDevCamDebugMetaEnable =
@@ -6430,6 +6462,7 @@ int QCamera3HardwareInterface::flush(bool restartChannels, bool stopChannelImmed
                 return rc;
             }
         }
+        mFirstPreviewIntentSeen = false;
     }
     pthread_mutex_unlock(&mMutex);
 
@@ -6817,6 +6850,7 @@ QCamera3HardwareInterface::translateFromHalMetadata(
     camMetadata.update(ANDROID_REQUEST_PIPELINE_DEPTH, &pendingRequest.pipeline_depth, 1);
     camMetadata.update(ANDROID_CONTROL_CAPTURE_INTENT, &pendingRequest.capture_intent, 1);
     camMetadata.update(NEXUS_EXPERIMENTAL_2016_HYBRID_AE_ENABLE, &pendingRequest.hybrid_ae_enable, 1);
+    camMetadata.update(NEXUS_EXPERIMENTAL_2017_MOTION_DETECTION_ENABLE, &pendingRequest.motion_detection_enable, 1);
     if (mBatchSize == 0) {
         // DevCamDebug metadata translateFromHalMetadata. Only update this one for non-HFR mode
         camMetadata.update(DEVCAMDEBUG_META_ENABLE, &pendingRequest.DevCamDebug_meta_enable, 1);
@@ -8248,6 +8282,26 @@ QCamera3HardwareInterface::translateFromHalMetadata(
             frame_ois_data->ois_sample_shift_pixel_x, frame_ois_data->num_ois_sample);
         camMetadata.update(NEXUS_EXPERIMENTAL_2017_OIS_SHIFT_PIXEL_Y,
             frame_ois_data->ois_sample_shift_pixel_y, frame_ois_data->num_ois_sample);
+    }
+
+    // DevCamDebug metadata translateFromHalMetadata AEC MOTION
+    IF_META_AVAILABLE(float, DevCamDebug_aec_camera_motion_dx,
+            CAM_INTF_META_DEV_CAM_AEC_CAMERA_MOTION_DX, metadata) {
+        float fwk_DevCamDebug_aec_camera_motion_dx = *DevCamDebug_aec_camera_motion_dx;
+        camMetadata.update(NEXUS_EXPERIMENTAL_2017_CAMERA_MOTION_X,
+                           &fwk_DevCamDebug_aec_camera_motion_dx, 1);
+    }
+    IF_META_AVAILABLE(float, DevCamDebug_aec_camera_motion_dy,
+            CAM_INTF_META_DEV_CAM_AEC_CAMERA_MOTION_DY, metadata) {
+        float fwk_DevCamDebug_aec_camera_motion_dy = *DevCamDebug_aec_camera_motion_dy;
+        camMetadata.update(NEXUS_EXPERIMENTAL_2017_CAMERA_MOTION_Y,
+                           &fwk_DevCamDebug_aec_camera_motion_dy, 1);
+    }
+    IF_META_AVAILABLE(float, DevCamDebug_aec_subject_motion,
+            CAM_INTF_META_DEV_CAM_AEC_SUBJECT_MOTION, metadata) {
+        float fwk_DevCamDebug_aec_subject_motion = *DevCamDebug_aec_subject_motion;
+        camMetadata.update(NEXUS_EXPERIMENTAL_2017_SUBJECT_MOTION,
+                           &fwk_DevCamDebug_aec_subject_motion, 1);
     }
 
     resultMetadata = camMetadata.release();
@@ -10394,7 +10448,8 @@ int QCamera3HardwareInterface::initStaticMetadata(uint32_t cameraId)
        TANGO_MODE_DATA_SENSOR_FULLFOV,
        NEXUS_EXPERIMENTAL_2017_TRACKING_AF_TRIGGER,
        NEXUS_EXPERIMENTAL_2017_PD_DATA_ENABLE,
-       NEXUS_EXPERIMENTAL_2017_EXIF_MAKERNOTE
+       NEXUS_EXPERIMENTAL_2017_EXIF_MAKERNOTE,
+       NEXUS_EXPERIMENTAL_2017_MOTION_DETECTION_ENABLE,
        };
 
     size_t request_keys_cnt =
@@ -10537,7 +10592,11 @@ int QCamera3HardwareInterface::initStaticMetadata(uint32_t cameraId)
        NEXUS_EXPERIMENTAL_2017_OIS_SHIFT_X,
        NEXUS_EXPERIMENTAL_2017_OIS_SHIFT_Y,
        NEXUS_EXPERIMENTAL_2017_OIS_SHIFT_PIXEL_X,
-       NEXUS_EXPERIMENTAL_2017_OIS_SHIFT_PIXEL_Y
+       NEXUS_EXPERIMENTAL_2017_OIS_SHIFT_PIXEL_Y,
+       NEXUS_EXPERIMENTAL_2017_MOTION_DETECTION_ENABLE,
+       NEXUS_EXPERIMENTAL_2017_CAMERA_MOTION_X,
+       NEXUS_EXPERIMENTAL_2017_CAMERA_MOTION_Y,
+       NEXUS_EXPERIMENTAL_2017_SUBJECT_MOTION
        };
 
     size_t result_keys_cnt =
@@ -10918,7 +10977,7 @@ int QCamera3HardwareInterface::initStaticMetadata(uint32_t cameraId)
         if (eepromLength + sizeof(easelInfo) < MAX_EEPROM_VERSION_INFO_LEN) {
             eepromLength += sizeof(easelInfo);
             strlcat(eepromInfo, ((gEaselManagerClient != nullptr &&
-                    gEaselManagerClient->isEaselPresentOnDevice()) ? ",E-ver" : ",E:N"),
+                    gEaselManagerClient->isEaselPresentOnDevice()) ? ",E-Y" : ",E:N"),
                     MAX_EEPROM_VERSION_INFO_LEN);
         }
         staticInfo.update(NEXUS_EXPERIMENTAL_2017_EEPROM_VERSION_INFO,
@@ -11177,7 +11236,7 @@ int QCamera3HardwareInterface::initHdrPlusClientLocked() {
             ALOGE("%s: Suspending Easel failed: %s (%d)", __FUNCTION__, strerror(-res), res);
         }
 
-        gEaselBypassOnly = !property_get_bool("persist.camera.hdrplus.enable", false);
+        gEaselBypassOnly = property_get_bool("persist.camera.hdrplus.disable", false);
         gEaselProfilingEnabled = property_get_bool("persist.camera.hdrplus.profiling", false);
 
         // Expose enableZsl key only when HDR+ mode is enabled.
@@ -13337,6 +13396,15 @@ int QCamera3HardwareInterface::translateFwkMetadataToHalMetadata(
         }
     }
 
+    // Motion Detection
+    if (frame_settings.exists(NEXUS_EXPERIMENTAL_2017_MOTION_DETECTION_ENABLE)) {
+        uint8_t *motion_detection = (uint8_t *)
+                frame_settings.find(NEXUS_EXPERIMENTAL_2017_MOTION_DETECTION_ENABLE).data.u8;
+        if (ADD_SET_PARAM_ENTRY_TO_BATCH(hal_metadata, CAM_INTF_META_MOTION_DETECTION_ENABLE, *motion_detection)) {
+            rc = BAD_VALUE;
+        }
+    }
+
     // Histogram
     if (frame_settings.exists(NEXUS_EXPERIMENTAL_2017_HISTOGRAM_ENABLE)) {
         uint8_t histogramMode =
@@ -15189,7 +15257,7 @@ status_t QCamera3HardwareInterface::openHdrPlusClientAsyncLocked()
         return OK;
     }
 
-    status_t res = gEaselManagerClient->openHdrPlusClientAsync(this);
+    status_t res = gEaselManagerClient->openHdrPlusClientAsync(mQCamera3HdrPlusListenerThread.get());
     if (res != OK) {
         ALOGE("%s: Opening HDR+ client asynchronously failed: %s (%d)", __FUNCTION__,
                 strerror(-res), res);
@@ -15354,6 +15422,13 @@ status_t QCamera3HardwareInterface::configureHdrPlusStreamsLocked()
 
 void QCamera3HardwareInterface::handleEaselFatalError()
 {
+    {
+        std::unique_lock<std::mutex> l(gHdrPlusClientLock);
+        if (gHdrPlusClient != nullptr) {
+            gHdrPlusClient->nofityEaselFatalError();
+        }
+    }
+
     pthread_mutex_lock(&mMutex);
     mState = ERROR;
     pthread_mutex_unlock(&mMutex);
@@ -15765,25 +15840,20 @@ void QCamera3HardwareInterface::onFailedCaptureResult(pbcamera::CaptureResult *f
             streamBuffer.acquire_fence = -1;
             streamBuffer.release_fence = -1;
 
-            streamBuffers.push_back(streamBuffer);
-
             // Send out error buffer event.
             camera3_notify_msg_t notify_msg = {};
             notify_msg.type = CAMERA3_MSG_ERROR;
             notify_msg.message.error.frame_number = pendingBuffers->frame_number;
-            notify_msg.message.error.error_code = CAMERA3_MSG_ERROR_BUFFER;
+            notify_msg.message.error.error_code = CAMERA3_MSG_ERROR_REQUEST;
             notify_msg.message.error.error_stream = buffer.stream;
 
             orchestrateNotify(&notify_msg);
+            mOutputBufferDispatcher.markBufferReady(pendingBuffers->frame_number, streamBuffer);
         }
 
-        camera3_capture_result_t result = {};
-        result.frame_number = pendingBuffers->frame_number;
-        result.num_output_buffers = streamBuffers.size();
-        result.output_buffers = &streamBuffers[0];
+        mShutterDispatcher.clear(pendingBuffers->frame_number);
 
-        // Send out result with buffer errors.
-        orchestrateResult(&result);
+
 
         // Remove pending buffers.
         mPendingBuffersMap.mPendingBuffersInRequest.erase(pendingBuffers);
@@ -15801,7 +15871,6 @@ void QCamera3HardwareInterface::onFailedCaptureResult(pbcamera::CaptureResult *f
 
     pthread_mutex_unlock(&mMutex);
 }
-
 
 ShutterDispatcher::ShutterDispatcher(QCamera3HardwareInterface *parent) :
         mParent(parent) {}

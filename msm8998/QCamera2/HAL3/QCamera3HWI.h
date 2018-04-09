@@ -47,6 +47,7 @@
 #include "QCameraCommon.h"
 #include "QCamera3VendorTags.h"
 #include "QCameraDualCamSettings.h"
+#include "QCamera3HdrPlusListenerThread.h"
 
 #include "EaselManagerClient.h"
 #include "HdrPlusClient.h"
@@ -596,6 +597,7 @@ private:
         uint8_t capture_intent;
         uint8_t fwkCacMode;
         uint8_t hybrid_ae_enable;
+        uint8_t motion_detection_enable;
         /* DevCamDebug metadata PendingRequestInfo */
         uint8_t DevCamDebug_meta_enable;
         /* DevCamDebug metadata end */
@@ -894,6 +896,9 @@ private:
     int32_t mSceneDistance;
 
     std::future<void> mEaselErrorFuture;
+
+    // Thread to handle callbacks from HDR+ client. Protected by gHdrPlusClientLock.
+    sp<QCamera3HdrPlusListenerThread> mQCamera3HdrPlusListenerThread;
 };
 
 }; // namespace qcamera
